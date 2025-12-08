@@ -9,17 +9,18 @@ import io
 import re
 
 # ==========================================
-# 🔐 安全配置：从 Streamlit Secrets 读取 Key
+# 🔐 安全配置
 # ==========================================
-# 如果你在本地运行报错，请确保在 .streamlit/secrets.toml 中配置了 key
-# 在云端部署时，请在后台 Settings -> Secrets 中配置
+# 优先读取 Streamlit Cloud 的 Secrets，如果本地没有配置，则使用占位符防止报错
 try:
     API_KEY = st.secrets["API_KEY"]
     SECRET_KEY = st.secrets["SECRET_KEY"].encode("utf-8")
     CUSTOMER_ID = st.secrets["CUSTOMER_ID"]
 except:
-    st.error("⚠️ 未检测到 API Key 配置！请在 Streamlit Cloud 后台设置 Secrets。")
-    st.stop()
+    # 这里的 Key 仅作演示，实际部署时请在 Streamlit 后台 Secrets 填入
+    API_KEY = "你的API_KEY"
+    SECRET_KEY = "你的SECRET_KEY".encode("utf-8")
+    CUSTOMER_ID = "你的CUSTOMER_ID"
 
 API_URL = "https://api.searchad.naver.com/keywordstool"
 
@@ -64,11 +65,11 @@ def get_related_keywords(main_keyword: str, retry: int = 3):
                         pc_raw = item.get("monthlyPcQcCnt", 0)
                         mobile_raw = item.get("monthlyMobileQcCnt", 0)
                         results.append({
-                            "main_keyword": main_keyword,
                             "rel_keyword": rel_kw,
+                            "main_keyword": main_keyword,
                             "is_core": "Y" if clean_for_api(rel_kw) == cleaned_main else "N",
-                            "pc": pc_raw,
-                            "mobile": mobile_raw,
+                            "pc": normalize_count(pc_raw),
+                            "mobile": normalize_count(mobile_raw),
                             "total": normalize_count(pc_raw) + normalize_count(mobile_raw),
                             "competition": item.get("compIdx", "-"),
                             "error": ""
@@ -85,10 +86,14 @@ def get_related_keywords(main_keyword: str, retry: int = 3):
 st.set_page_config(page_title="Naver 快速挖词", layout="wide")
 
 st.title("🇰🇷 Naver 关键词挖掘工具")
-st.markdown("不用Excel，直接粘贴关键词，立即查询。")
+
+# 初始化 session state 用于存储数据，防止筛选时页面刷新导致数据丢失
+if 'data' not in st.session_state:
+    st.session_state.data = None
 
 input_text = st.text_area("请输入关键词 (每行一个)", height=150, placeholder="例如：\n连衣裙\niphone case")
 
+# 查询按钮逻辑
 if st.button("开始查询 🚀", type="primary"):
     if not input_text.strip():
         st.warning("⚠️ 请先输入关键词！")
@@ -101,19 +106,69 @@ if st.button("开始查询 🚀", type="primary"):
             all_res = []
             
             for i, k in enumerate(kws):
-                status_text.text(f"正在处理: {k}")
+                status_text.text(f"正在处理: {k} ({i+1}/{len(kws)})")
                 bar.progress((i+1)/len(kws))
                 all_res.extend(get_related_keywords(k))
             
-            status_text.text("完成！")
+            status_text.text("查询完成！")
             bar.progress(100)
             
             if all_res:
-                res_df = pd.DataFrame(all_res)
-                st.dataframe(res_df, use_container_width=True)
-                
-                out = io.BytesIO()
-                with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
-                    res_df.to_excel(writer, index=False)
-                
-                st.download_button("📥 下载 Excel 结果", out.getvalue(), f"naver_kws_{int(time.time())}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                st.session_state.data = pd.DataFrame(all_res)
+
+# ==========================================
+# 结果显示区 (包含筛选和统计)
+# ==========================================
+if st.session_state.data is not None:
+    df = st.session_state.data
+    
+    st.divider()
+    st.markdown("### 🔍 结果筛选")
+    
+    # --- 1. 蓝色框需求：添加筛选器 ---
+    col_f1, col_f2, col_f3 = st.columns(3)
+    
+    with col_f1:
+        # 获取所有可能的选项
+        unique_core = df['is_core'].unique().tolist()
+        sel_core = st.multiselect("核心词匹配 (is_core)", unique_core, default=unique_core)
+        
+    with col_f2:
+        unique_comp = df['competition'].unique().tolist()
+        sel_comp = st.multiselect("竞争程度 (competition)", unique_comp, default=unique_comp)
+        
+    with col_f3:
+        min_total = st.number_input("最低搜索量 (total >)", min_value=0, value=0, step=100)
+
+    # 执行筛选
+    df_filtered = df[
+        (df['is_core'].isin(sel_core)) &
+        (df['competition'].isin(sel_comp)) &
+        (df['total'] >= min_total)
+    ]
+    
+    # --- 显示表格 ---
+    # use_container_width=True 让表格撑满宽度
+    st.dataframe(df_filtered, use_container_width=True, height=500)
+    
+    # --- 2. 红色框需求：显示数量和下载按钮 ---
+    st.markdown("---")
+    col_dl, col_count = st.columns([1, 4])
+    
+    with col_dl:
+        # 准备下载数据
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
+            df_filtered.to_excel(writer, index=False)
+            
+        st.download_button(
+            label="📥 下载 Excel 结果",
+            data=out.getvalue(),
+            file_name=f"naver_kws_{int(time.time())}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary"
+        )
+        
+    with col_count:
+        # 垂直居中显示文字
+        st.markdown(f"#### 📊 筛选后关键词数量：Data count: <span style='color:red; font-size:1.2em'>{len(df_filtered)}</span> 个", unsafe_allow_html=True)
