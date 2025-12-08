@@ -11,7 +11,6 @@ import re
 # ==========================================
 # 🔐 安全配置
 # ==========================================
-# 优先读取 Streamlit Cloud 的 Secrets，如果本地没有配置，则使用占位符防止报错
 try:
     API_KEY = st.secrets["API_KEY"]
     SECRET_KEY = st.secrets["SECRET_KEY"].encode("utf-8")
@@ -87,13 +86,11 @@ st.set_page_config(page_title="Naver 快速挖词", layout="wide")
 
 st.title("🇰🇷 Naver 关键词挖掘工具")
 
-# 初始化 session state 用于存储数据，防止筛选时页面刷新导致数据丢失
 if 'data' not in st.session_state:
     st.session_state.data = None
 
 input_text = st.text_area("请输入关键词 (每行一个)", height=150, placeholder="例如：\n连衣裙\niphone case")
 
-# 查询按钮逻辑
 if st.button("开始查询 🚀", type="primary"):
     if not input_text.strip():
         st.warning("⚠️ 请先输入关键词！")
@@ -117,26 +114,22 @@ if st.button("开始查询 🚀", type="primary"):
                 st.session_state.data = pd.DataFrame(all_res)
 
 # ==========================================
-# 结果显示区 (包含筛选和统计)
+# 结果显示区
 # ==========================================
 if st.session_state.data is not None:
     df = st.session_state.data
     
     st.divider()
-    st.markdown("### 🔍 结果筛选")
+    st.markdown("### 🔍 结果筛选与导出")
     
-    # --- 1. 蓝色框需求：添加筛选器 ---
+    # 1. 筛选器
     col_f1, col_f2, col_f3 = st.columns(3)
-    
     with col_f1:
-        # 获取所有可能的选项
         unique_core = df['is_core'].unique().tolist()
         sel_core = st.multiselect("核心词匹配 (is_core)", unique_core, default=unique_core)
-        
     with col_f2:
         unique_comp = df['competition'].unique().tolist()
         sel_comp = st.multiselect("竞争程度 (competition)", unique_comp, default=unique_comp)
-        
     with col_f3:
         min_total = st.number_input("最低搜索量 (total >)", min_value=0, value=0, step=100)
 
@@ -147,22 +140,23 @@ if st.session_state.data is not None:
         (df['total'] >= min_total)
     ]
     
-    # --- 显示表格 ---
-    # use_container_width=True 让表格撑满宽度
-    st.dataframe(df_filtered, use_container_width=True, height=500)
+    # 显示表格
+    st.dataframe(df_filtered, use_container_width=True, height=400)
     
-    # --- 2. 红色框需求：显示数量和下载按钮 ---
+    # -------------------------------------------------------
+    # 底部操作区：下载 Excel + 数据统计 + AI 复制
+    # -------------------------------------------------------
     st.markdown("---")
+    
+    # 第一行：下载按钮 和 数量显示
     col_dl, col_count = st.columns([1, 4])
     
     with col_dl:
-        # 准备下载数据
         out = io.BytesIO()
         with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
             df_filtered.to_excel(writer, index=False)
-            
         st.download_button(
-            label="📥 下载 Excel 结果",
+            label="📥 下载 Excel",
             data=out.getvalue(),
             file_name=f"naver_kws_{int(time.time())}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -170,5 +164,14 @@ if st.session_state.data is not None:
         )
         
     with col_count:
-        # 垂直居中显示文字
-        st.markdown(f"#### 📊 筛选后关键词数量：Data count: <span style='color:red; font-size:1.2em'>{len(df_filtered)}</span> 个", unsafe_allow_html=True)
+        st.markdown(f"#### 📊 筛选后数量： <span style='color:red; font-size:1.2em'>{len(df_filtered)}</span> 个", unsafe_allow_html=True)
+
+    # -------------------------------------------------------
+    # 新增功能：一键复制给 Gemini
+    # -------------------------------------------------------
+    st.markdown("### 🤖 发送给 AI 分析")
+    with st.expander("📋 点击展开，一键复制数据 (Paste to Gemini)", expanded=False):
+        st.caption("👇 点击代码块右上角的 'Copy' 图标，然后直接粘贴给 Gemini 即可。")
+        # 将 DataFrame 转为 CSV 文本供复制
+        csv_text = df_filtered.to_csv(index=False)
+        st.code(csv_text, language='csv')
