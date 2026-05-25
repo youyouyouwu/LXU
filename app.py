@@ -12,50 +12,48 @@ import re
 # =========================================================
 # 页面设置
 # =========================================================
-APP_VERSION = "手动输入 + Excel/CSV 下载版 v4"
+APP_VERSION = "手动输入 + Streamlit Secrets + Excel/CSV 下载版 v6"
 
 st.set_page_config(page_title="Naver 快速挖词", layout="wide")
 
 
 # =========================================================
-# API 配置：建议放在 Streamlit Secrets
-# Secrets 里需要有：
+# API 配置：只从 Streamlit Secrets 读取
+#
+# Streamlit Cloud → App settings → Secrets 里填写：
+#
 # API_KEY = "你的 Naver API Key"
 # SECRET_KEY = "你的 Naver Secret Key"
 # CUSTOMER_ID = "你的 Customer ID"
+#
+# 也兼容下面这种命名：
+#
+# NAVER_API_KEY = "你的 Naver API Key"
+# NAVER_SECRET_KEY = "你的 Naver Secret Key"
+# NAVER_CUSTOMER_ID = "你的 Customer ID"
 # =========================================================
-def get_secret(name: str) -> str:
-    try:
-        value = st.secrets.get(name, "")
-        return str(value) if value else ""
-    except Exception:
-        return ""
+def read_secret(*names: str) -> str:
+    """从 Streamlit Secrets 读取配置，不在代码里保存任何真实 API 信息"""
+    for name in names:
+        try:
+            value = st.secrets.get(name, "")
+            if value:
+                return str(value)
+        except Exception:
+            pass
+
+    return ""
 
 
-API_KEY = get_secret("API_KEY")
-SECRET_KEY_TEXT = get_secret("SECRET_KEY")
-CUSTOMER_ID = get_secret("CUSTOMER_ID")
+API_KEY = read_secret("API_KEY", "NAVER_API_KEY")
+SECRET_KEY_TEXT = read_secret("SECRET_KEY", "NAVER_SECRET_KEY")
+CUSTOMER_ID = read_secret("CUSTOMER_ID", "NAVER_CUSTOMER_ID")
 
-if not API_KEY or not SECRET_KEY_TEXT or not CUSTOMER_ID:
-    st.title("🇰🇷 Naver 关键词挖掘工具")
-    st.caption(f"当前版本：{APP_VERSION}")
-    st.error("缺少 API 配置。请在 Streamlit Cloud 的 Secrets 里添加 API_KEY、SECRET_KEY、CUSTOMER_ID。")
-    st.code(
-        """
-API_KEY = "你的 Naver API Key"
-SECRET_KEY = "你的 Naver Secret Key"
-CUSTOMER_ID = "你的 Customer ID"
-""".strip(),
-        language="toml",
-    )
-    st.stop()
-
-SECRET_KEY = SECRET_KEY_TEXT.encode("utf-8")
 API_URL = "https://api.searchad.naver.com/keywordstool"
 
 
 # =========================================================
-# 核心函数
+# 工具函数
 # =========================================================
 def clean_for_api(keyword: str) -> str:
     """去掉空格，给 Naver API 使用"""
@@ -64,8 +62,9 @@ def clean_for_api(keyword: str) -> str:
 
 def make_signature(method: str, uri: str, timestamp: str) -> str:
     """生成 Naver SearchAd API 签名"""
+    secret_key_bytes = SECRET_KEY_TEXT.encode("utf-8")
     message = f"{timestamp}.{method}.{uri}".encode("utf-8")
-    signature = hmac.new(SECRET_KEY, message, hashlib.sha256).digest()
+    signature = hmac.new(secret_key_bytes, message, hashlib.sha256).digest()
     return base64.b64encode(signature).decode("utf-8")
 
 
@@ -93,7 +92,7 @@ def normalize_count(raw) -> int:
         if s.startswith("<"):
             return 5
 
-        # 兼容 "> 1000"
+        # 兼容 "> 1000" 或 ">1000"
         if s.startswith(">"):
             nums = re.sub(r"\D", "", s)
             return int(nums) if nums else 0
@@ -149,7 +148,7 @@ def get_related_keywords(main_keyword: str, retry: int = 3) -> list[dict]:
                 continue
 
             if res.status_code != 200:
-                last_error = f"HTTP {res.status_code}: {res.text[:120]}"
+                last_error = f"HTTP {res.status_code}: {res.text[:150]}"
                 time.sleep(1)
                 continue
 
@@ -234,14 +233,47 @@ def make_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
+def ensure_result_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """确保结果表字段齐全，避免筛选时报错"""
+    required_columns = [
+        "main_keyword",
+        "rel_keyword",
+        "is_core",
+        "pc",
+        "mobile",
+        "total",
+        "competition",
+        "error",
+    ]
+
+    for col in required_columns:
+        if col not in df.columns:
+            df[col] = ""
+
+    df["total"] = pd.to_numeric(df["total"], errors="coerce").fillna(0).astype(int)
+    df["pc"] = pd.to_numeric(df["pc"], errors="coerce").fillna(0).astype(int)
+    df["mobile"] = pd.to_numeric(df["mobile"], errors="coerce").fillna(0).astype(int)
+
+    return df[required_columns]
+
+
 # =========================================================
 # Session State
 # =========================================================
 if "data" not in st.session_state:
     st.session_state.data = None
 
-if "last_input" not in st.session_state:
-    st.session_state.last_input = ""
+if "keyword_text" not in st.session_state:
+    st.session_state.keyword_text = ""
+
+if "last_file_timestamp" not in st.session_state:
+    st.session_state.last_file_timestamp = ""
+
+
+def clear_all():
+    st.session_state.data = None
+    st.session_state.keyword_text = ""
+    st.session_state.last_file_timestamp = ""
 
 
 # =========================================================
@@ -251,10 +283,23 @@ st.title("🇰🇷 Naver 关键词挖掘工具")
 st.caption(f"当前版本：{APP_VERSION}")
 st.markdown("输入关键词，每行一个。查询完成后可以下载 Excel 或 CSV。")
 
+if not API_KEY or not SECRET_KEY_TEXT or not CUSTOMER_ID:
+    st.error("缺少 API 配置。请在 Streamlit Cloud 的 Secrets 里添加 API_KEY、SECRET_KEY、CUSTOMER_ID。")
+    st.code(
+        """
+API_KEY = "你的 Naver API Key"
+SECRET_KEY = "你的 Naver Secret Key"
+CUSTOMER_ID = "你的 Customer ID"
+""".strip(),
+        language="toml",
+    )
+    st.stop()
+
+
 input_text = st.text_area(
     "请输入关键词（每行一个）",
     height=160,
-    value=st.session_state.last_input,
+    key="keyword_text",
     placeholder="例如：\n노트북거치대\n자전거거치대\n아이패드거치대",
 )
 
@@ -264,21 +309,15 @@ with col_start:
     start_clicked = st.button("开始查询 🚀", type="primary", use_container_width=True)
 
 with col_clear:
-    clear_clicked = st.button("清空结果", use_container_width=True)
+    st.button("清空结果", use_container_width=True, on_click=clear_all)
 
-if clear_clicked:
-    st.session_state.data = None
-    st.session_state.last_input = ""
-    st.rerun()
 
 if start_clicked:
     if not input_text.strip():
         st.warning("请先输入关键词。")
     else:
-        st.session_state.last_input = input_text
-
         keywords = [line.strip() for line in input_text.splitlines() if line.strip()]
-        keywords = list(dict.fromkeys(keywords))  # 去重并保留顺序
+        keywords = list(dict.fromkeys(keywords))  # 去重，并保留原顺序
 
         st.info(f"正在查询 {len(keywords)} 个关键词...")
 
@@ -290,12 +329,19 @@ if start_clicked:
             status_text.text(f"正在处理：{keyword} ({i + 1}/{len(keywords)})")
             all_rows.extend(get_related_keywords(keyword))
             progress_bar.progress((i + 1) / len(keywords))
+
+            # 避免请求太密集
             time.sleep(0.3)
 
         status_text.text("查询完成！")
         progress_bar.progress(1.0)
 
-        st.session_state.data = pd.DataFrame(all_rows)
+        df_result = pd.DataFrame(all_rows)
+        df_result = ensure_result_columns(df_result)
+
+        st.session_state.data = df_result
+        st.session_state.last_file_timestamp = time.strftime("%Y%m%d_%H%M%S")
+
         st.success("🎉 查询完成！")
 
 
@@ -304,17 +350,18 @@ if start_clicked:
 # =========================================================
 if st.session_state.data is not None:
     df = st.session_state.data.copy()
+    df = ensure_result_columns(df)
 
     st.divider()
     st.markdown("### 🔍 结果筛选与导出")
 
-    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([1.2, 1.1, 1.1, 1.2])
+    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([1.3, 1.1, 1.1, 1.1])
 
     with filter_col1:
         keyword_filter = st.text_input(
             "关键词包含",
             value="",
-            placeholder="例如：거치대",
+            placeholder="例如：거치대 / 노트북 / 스탠드",
         )
 
     with filter_col2:
@@ -355,11 +402,14 @@ if st.session_state.data is not None:
         & (df_filtered["total"].fillna(0).astype(int) >= int(min_total))
     ]
 
+    df_filtered = df_filtered.sort_values(by="total", ascending=False).reset_index(drop=True)
+
     st.dataframe(df_filtered, use_container_width=True, height=420)
 
     st.markdown("---")
 
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    file_timestamp = st.session_state.last_file_timestamp or time.strftime("%Y%m%d_%H%M%S")
+
     excel_data = make_excel_bytes(df_filtered)
     csv_data = make_csv_bytes(df_filtered)
 
@@ -369,19 +419,21 @@ if st.session_state.data is not None:
         st.download_button(
             label="📥 下载 Excel",
             data=excel_data,
-            file_name=f"naver_kws_{timestamp}.xlsx",
+            file_name=f"naver_kws_{file_timestamp}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
             use_container_width=True,
+            key="download_excel",
         )
 
     with col_csv:
         st.download_button(
             label="📄 下载 CSV",
             data=csv_data,
-            file_name=f"naver_kws_{timestamp}.csv",
+            file_name=f"naver_kws_{file_timestamp}.csv",
             mime="text/csv",
             use_container_width=True,
+            key="download_csv",
         )
 
     with col_count:
@@ -392,5 +444,8 @@ if st.session_state.data is not None:
 
     st.markdown("### 🤖 给 AI 分析用")
     with st.expander("📋 展开复制 CSV 文本", expanded=False):
-        st.caption("也可以直接下载上面的 CSV 文件，再上传给 GPT 分析。")
+        st.caption("也可以直接点击上面的“下载 CSV”，然后上传给 GPT 分析。")
         st.code(df_filtered.to_csv(index=False), language="csv")
+
+else:
+    st.info("输入关键词后点击“开始查询”，查询完成后这里会显示结果和下载按钮。")
