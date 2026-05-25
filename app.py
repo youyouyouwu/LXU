@@ -4,7 +4,168 @@ import time
 import requests
 import hashlib
 import hmac
+import base64import streamlit as st
+import pandas as pd
+import time
+import requests
+import hashlib
+import hmac
 import base64
+import io
+import re
+
+# ==========================================
+# ⚠️ 这里的 Key 一定要填对
+# ==========================================
+API_KEY = "01000000002600ac5cb082cca74dcce7979c36b40f0ea607061eb8454f02026c998129ab03" 
+SECRET_KEY = "AQAAAAAmAKxcsILMp03M55ecNrQPWZjIxDBbElbfr1p+wtqBTw==".encode("utf-8")
+CUSTOMER_ID = "4197574"
+# ==========================================
+
+API_URL = "https://api.searchad.naver.com/keywordstool"
+
+def clean_for_api(keyword: str) -> str:
+    """去掉空格，给 API 用"""
+    return re.sub(r"\s+", "", str(keyword))
+
+def make_signature(method: str, uri: str, timestamp: str) -> str:
+    """按官方要求生成签名"""
+    message = f"{timestamp}.{method}.{uri}".encode("utf-8")
+    signature = hmac.new(SECRET_KEY, message, hashlib.sha256).digest()
+    return base64.b64encode(signature).decode("utf-8")
+
+def normalize_count(raw):
+    """把 Naver 返回的数据转成整数"""
+    if isinstance(raw, int): return raw
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.startswith("<"): return 5
+        if s.startswith(">"): return int(s[1:].strip()) if s[1:].strip().isdigit() else 0
+        s = s.replace(",", "")
+        if s.isdigit(): return int(s)
+    return 0
+
+def get_related_keywords(main_keyword: str, retry: int = 3):
+    """核心请求函数"""
+    query_kw = clean_for_api(main_keyword)
+    results = []
+
+    for attempt in range(1, retry + 1):
+        try:
+            timestamp = str(int(time.time() * 1000))
+            signature = make_signature("GET", "/keywordstool", timestamp)
+            headers = {
+                "X-Timestamp": timestamp,
+                "X-API-KEY": API_KEY,
+                "X-Customer": CUSTOMER_ID,
+                "X-Signature": signature,
+            }
+            params = {"hintKeywords": query_kw, "showDetail": 1}
+            res = requests.get(API_URL, headers=headers, params=params)
+
+            if not res.text or not res.text.strip():
+                time.sleep(1)
+                continue
+            if res.status_code != 200:
+                time.sleep(1)
+                continue
+
+            data = res.json()
+            if "keywordList" not in data or len(data["keywordList"]) == 0:
+                results.append({
+                    "main_keyword": main_keyword, "rel_keyword": "", "is_core": "Y",
+                    "pc": 0, "mobile": 0, "total": 0, "competition": "-", "error": "No Data"
+                })
+                return results
+
+            cleaned_main = clean_for_api(main_keyword)
+            for item in data["keywordList"]:
+                rel_kw = item.get("relKeyword", "")
+                pc_raw = item.get("monthlyPcQcCnt", 0)
+                mobile_raw = item.get("monthlyMobileQcCnt", 0)
+                total = normalize_count(pc_raw) + normalize_count(mobile_raw)
+                comp = item.get("compIdx", "-")
+                is_core = "Y" if clean_for_api(rel_kw) == cleaned_main else "N"
+
+                results.append({
+                    "main_keyword": main_keyword, "rel_keyword": rel_kw, "is_core": is_core,
+                    "pc": pc_raw, "mobile": mobile_raw, "total": total,
+                    "competition": comp, "error": ""
+                })
+            return results
+        except Exception:
+            time.sleep(1)
+
+    results.append({
+        "main_keyword": main_keyword, "rel_keyword": "", "is_core": "Y",
+        "pc": 0, "mobile": 0, "total": 0, "competition": "-", "error": "Failed"
+    })
+    return results
+
+# --- 网页界面 ---
+st.set_page_config(page_title="Naver 挖掘工具", layout="centered")
+st.title("🇰🇷 Naver 关键词挖掘工具")
+st.markdown("支持上传 .xlsx 或 .csv 文件，自动查询 Naver 官方数据。")
+
+uploaded_file = st.file_uploader("📂 上传 Excel/CSV 文件", type=['xlsx', 'csv'])
+
+if uploaded_file:
+    try:
+        if uploaded_file.name.endswith('.csv'):
+            df_input = pd.read_csv(uploaded_file)
+        else:
+            df_input = pd.read_excel(uploaded_file)
+        
+        # 默认取第一列
+        keywords_list = df_input.iloc[:, 0].dropna().astype(str).tolist()
+        keywords_list = [k.strip() for k in keywords_list if k.strip()]
+        
+        st.info(f"✅ 识别到 {len(keywords_list)} 个关键词")
+
+        if st.button("🚀 开始查询", type="primary"):
+            all_rows = []
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for i, mk in enumerate(keywords_list):
+                status_text.text(f"正在处理 ({i+1}/{len(keywords_list)}): {mk}")
+                progress_bar.progress((i + 1) / len(keywords_list))
+                all_rows.extend(get_related_keywords(mk))
+                time.sleep(0.3) 
+
+            df_result = pd.DataFrame(all_rows)
+            st.success("🎉 完成！")
+            
+            # 简单的结果展示
+            st.dataframe(df_result.head())
+
+            # 下载：同时支持 Excel 和 CSV
+            excel_output = io.BytesIO()
+            with pd.ExcelWriter(excel_output, engine='xlsxwriter') as writer:
+                df_result.to_excel(writer, index=False, sheet_name="result")
+            excel_data = excel_output.getvalue()
+
+            # CSV 用 utf-8-sig，中文/韩文在 Excel 中打开更不容易乱码，也适合后续上传给 GPT 分析
+            csv_data = df_result.to_csv(index=False).encode("utf-8-sig")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.download_button(
+                    "📥 下载结果 Excel",
+                    data=excel_data,
+                    file_name="naver_result.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            with col2:
+                st.download_button(
+                    "📄 下载结果 CSV",
+                    data=csv_data,
+                    file_name="naver_result.csv",
+                    mime="text/csv"
+                )
+
+    except Exception as e:
+        st.error(f"错误: {e}")
 import io
 import re
 
