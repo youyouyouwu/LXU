@@ -7,12 +7,13 @@ import hmac
 import base64
 import io
 import re
+import zipfile
 
 
 # =========================================================
 # 页面设置
 # =========================================================
-APP_VERSION = "手动输入 + Streamlit Secrets + Excel/CSV 下载版 v6"
+APP_VERSION = "手动输入 + Streamlit Secrets + Excel/CSV + AI分批CSV压缩包版 v7"
 
 st.set_page_config(page_title="Naver 快速挖词", layout="wide")
 
@@ -233,6 +234,81 @@ def make_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
+def make_ai_batch_zip_bytes(df: pd.DataFrame, batch_size: int = 500) -> tuple[bytes, int, int]:
+    """
+    生成 AI 分析用分批 CSV 压缩包。
+    - 以当前筛选后的结果为准。
+    - 每 batch_size 条生成 1 个 CSV。
+    - 使用 UTF-8-SIG，避免中文/韩文乱码。
+    - 表头改为中文，方便 GPTs / Project 直接分析。
+    """
+    df_ai = ensure_result_columns(df.copy())
+
+    rename_map = {
+        "main_keyword": "母词",
+        "rel_keyword": "关键词",
+        "is_core": "是否母词",
+        "pc": "PC搜索量",
+        "mobile": "移动搜索量",
+        "total": "月搜索量",
+        "competition": "NAVER广告竞争",
+        "error": "错误信息",
+    }
+
+    df_ai = df_ai.rename(columns=rename_map)
+
+    keep_cols = [
+        "母词",
+        "关键词",
+        "是否母词",
+        "PC搜索量",
+        "移动搜索量",
+        "月搜索量",
+        "NAVER广告竞争",
+        "错误信息",
+    ]
+    df_ai = df_ai[[col for col in keep_cols if col in df_ai.columns]]
+
+    total_rows = len(df_ai)
+    batch_count = (total_rows + batch_size - 1) // batch_size if total_rows else 1
+
+    zip_buffer = io.BytesIO()
+
+    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        readme = (
+            "AI分析用分批CSV说明\n"
+            "====================\n"
+            f"总词条数：{total_rows}\n"
+            f"每个CSV最大词条数：{batch_size}\n"
+            f"CSV文件数量：{batch_count}\n\n"
+            "说明：\n"
+            "1. 本压缩包按当前页面筛选后的结果生成。\n"
+            "2. 每个CSV最多500条，适合逐个上传给GPTs或Project分析。\n"
+            "3. 字段已改为中文，关键词保留韩文原文。\n"
+            "4. NAVER广告竞争仅代表广告侧参考，不等于真实商品竞争。\n"
+        )
+        zip_file.writestr("使用说明.txt", readme.encode("utf-8-sig"))
+
+        if total_rows == 0:
+            empty_csv = df_ai.to_csv(index=False).encode("utf-8-sig")
+            zip_file.writestr("AI分析用关键词_第001批_共001批_空数据.csv", empty_csv)
+        else:
+            for batch_index, start in enumerate(range(0, total_rows, batch_size), start=1):
+                end = min(start + batch_size, total_rows)
+                batch_df = df_ai.iloc[start:end].copy()
+
+                # 加上很轻量的追踪字段，方便后续合并
+                batch_df.insert(0, "批次", f"{batch_index}/{batch_count}")
+                batch_df.insert(1, "原始序号", range(start + 1, end + 1))
+
+                csv_bytes = batch_df.to_csv(index=False).encode("utf-8-sig")
+                csv_name = f"AI分析用关键词_第{batch_index:03d}批_共{batch_count:03d}批_{start + 1}-{end}.csv"
+                zip_file.writestr(csv_name, csv_bytes)
+
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue(), batch_count, total_rows
+
+
 def ensure_result_columns(df: pd.DataFrame) -> pd.DataFrame:
     """确保结果表字段齐全，避免筛选时报错"""
     required_columns = [
@@ -281,7 +357,7 @@ def clear_all():
 # =========================================================
 st.title("🇰🇷 Naver 关键词挖掘工具")
 st.caption(f"当前版本：{APP_VERSION}")
-st.markdown("输入关键词，每行一个。查询完成后可以下载 Excel 或 CSV。")
+st.markdown("输入关键词，每行一个。查询完成后可以下载 Excel、完整 CSV，以及 AI 分析用的分批 CSV 压缩包。")
 
 if not API_KEY or not SECRET_KEY_TEXT or not CUSTOMER_ID:
     st.error("缺少 API 配置。请在 Streamlit Cloud 的 Secrets 里添加 API_KEY、SECRET_KEY、CUSTOMER_ID。")
@@ -412,8 +488,9 @@ if st.session_state.data is not None:
 
     excel_data = make_excel_bytes(df_filtered)
     csv_data = make_csv_bytes(df_filtered)
+    ai_zip_data, ai_batch_count, ai_total_rows = make_ai_batch_zip_bytes(df_filtered, batch_size=500)
 
-    col_excel, col_csv, col_count = st.columns([1.1, 1.1, 3])
+    col_excel, col_csv, col_ai_zip, col_count = st.columns([1.1, 1.1, 1.6, 2.7])
 
     with col_excel:
         st.download_button(
@@ -428,7 +505,7 @@ if st.session_state.data is not None:
 
     with col_csv:
         st.download_button(
-            label="📄 下载 CSV",
+            label="📄 下载完整 CSV",
             data=csv_data,
             file_name=f"naver_kws_{file_timestamp}.csv",
             mime="text/csv",
@@ -436,16 +513,28 @@ if st.session_state.data is not None:
             key="download_csv",
         )
 
+    with col_ai_zip:
+        st.download_button(
+            label="🤖 下载AI分批CSV ZIP",
+            data=ai_zip_data,
+            file_name=f"AI分析用关键词分批_{file_timestamp}_{ai_total_rows}条_{ai_batch_count}份.zip",
+            mime="application/zip",
+            use_container_width=True,
+            key="download_ai_zip",
+        )
+
     with col_count:
         st.markdown(
             f"#### 📊 筛选后数量： <span style='color:red; font-size:1.2em'>{len(df_filtered)}</span> 个",
             unsafe_allow_html=True,
         )
+        st.caption(f"AI分批CSV：每500条一份，共 {ai_batch_count} 份。")
 
     st.markdown("### 🤖 给 AI 分析用")
-    with st.expander("📋 展开复制 CSV 文本", expanded=False):
-        st.caption("也可以直接点击上面的“下载 CSV”，然后上传给 GPT 分析。")
-        st.code(df_filtered.to_csv(index=False), language="csv")
+    with st.expander("📋 展开复制 CSV 文本预览", expanded=False):
+        st.caption("这里只显示前500条预览。完整分批文件请点击“下载AI分批CSV ZIP”。")
+        preview_df = df_filtered.head(500)
+        st.code(preview_df.to_csv(index=False), language="csv")
 
 else:
     st.info("输入关键词后点击“开始查询”，查询完成后这里会显示结果和下载按钮。")
